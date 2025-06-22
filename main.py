@@ -1,20 +1,25 @@
 import os
 import random
-import httpx
+import httpx # Library for making HTTP requests
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
 from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.exc import IntegrityError
+# Đã sửa lỗi cảnh báo: import declarative_base từ sqlalchemy.orm thay vì sqlalchemy.ext.declarative
+from sqlalchemy.orm import sessionmaker, Session, declarative_base 
+from sqlalchemy.exc import IntegrityError # To handle duplicate key errors
 
 app = FastAPI()
 
 # --- Database Configuration (PostgreSQL) ---
+# Lấy chuỗi kết nối từ biến môi trường (cho Render)
+# Fallback (dự phòng) về một chuỗi kết nối PostgreSQL cục bộ hoặc SQLite cho phát triển cục bộ
+# Nếu bạn chạy cục bộ với PostgreSQL, hãy thay đổi "postgresql://user:password@localhost/taixiu_db" cho phù hợp
+# Nếu bạn muốn chạy cục bộ với SQLite và chấp nhận mất dữ liệu khi ứng dụng khởi động lại, hãy dùng: "sqlite:///./taixiu.db"
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/taixiu_db") 
 
+# Tạo engine và session maker
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 Base = declarative_base()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -24,7 +29,9 @@ class PhienTaiXiu(Base):
     __tablename__ = "phien_tai_xiu"
     
     id = Column(Integer, primary_key=True, index=True)
+    # expect_string từ API bên ngoài, dùng làm định danh duy nhất cho một phiên
     expect_string = Column(String, unique=True, index=True, nullable=False) 
+    # expect_string chuyển đổi sang số nguyên, để sắp xếp và truy vấn dễ hơn
     phien_so_nguyen = Column(Integer, index=True, nullable=False) 
     
     open_time = Column(DateTime)
@@ -33,9 +40,15 @@ class PhienTaiXiu(Base):
     xuc_xac_1 = Column(Integer)
     xuc_xac_2 = Column(Integer)
     xuc_xac_3 = Column(Integer)
-    created_at = Column(DateTime, default=datetime.now) 
+    created_at = Column(DateTime, default=datetime.now) # Thời gian record được tạo trong DB của chúng ta
 
-# Dependency to get a DB session
+# --- KHỞI TẠO BẢNG DATABASE (QUAN TRỌNG) ---
+# Uncomment dòng này VÀ CHẠY ỨNG DỤNG MỘT LẦN ĐỂ TẠO BẢNG trong cơ sở dữ liệu PostgreSQL của bạn.
+# SAU KHI BẢNG ĐƯỢC TẠO THÀNH CÔNG, HÃY COMMENT LẠI dòng này và triển khai lại.
+# Nếu bạn đang sử dụng SQLite, điều này cũng sẽ tạo file .db
+Base.metadata.create_all(bind=engine)
+
+# Dependency để lấy Session DB cho mỗi request
 def get_db():
     db = SessionLocal()
     try:
@@ -43,72 +56,85 @@ def get_db():
     finally:
         db.close()
 
-# --- Tai Xiu Logic ---
+# --- Logic tính Tài Xỉu ---
 def get_tai_xiu_result(xuc_xac_values: List[int]) -> Dict[str, any]:
-    """Calculates Tai/Xiu result from 3 dice values."""
+    """Tính toán kết quả Tài/Xỉu từ 3 giá trị xúc xắc."""
     if len(xuc_xac_values) != 3:
         raise ValueError("Phải có đúng 3 giá trị xúc xắc.")
 
     x1, x2, x3 = xuc_xac_values
     tong = x1 + x2 + x3
-    ket_qua = "Tài" if 11 <= tong <= 17 else "Xỉu"
+    ket_qua = "Tài" if 11 <= tong <= 17 else "Xỉu" # Tài: 11-17, Xỉu: 4-10
 
-    # Rule for "Bão" (triple dice) - often classified as Xỉu
+    # Quy tắc cho "Bão" (bộ 3 đồng nhất) - thường được coi là Xỉu
     if x1 == x2 == x3:
-        ket_qua = "Xỉu" # Triplets (1-1-1 to 6-6-6) are often considered special "Xỉu"
+        ket_qua = "Xỉu" # Bộ 3 đồng nhất (ví dụ: 1-1-1, 6-6-6) được coi là Xỉu
 
     return {"Tong": tong, "Xuc_xac_1": x1, "Xuc_xac_2": x2, "Xuc_xac_3": x3, "Ket_qua": ket_qua}
 
-# --- Pattern (Cầu) Analysis and Prediction Logic ---
-
+# --- Logic phân tích "Cầu" và Dự đoán ---
 def analyze_patterns_and_predict(historical_results: List[str]) -> Dict[str, str]:
     """
-    Analyzes common "cầu" patterns in historical results and provides a prediction.
-    This is a simplified example focusing on common patterns.
+    Phân tích các mẫu "cầu" phổ biến trong lịch sử và đưa ra dự đoán.
+    Đây là một ví dụ đơn giản tập trung vào các mẫu cầu cơ bản.
     """
-    if len(historical_results) < 5: # Need at least a few results to find patterns
+    # Cần ít nhất 5 kết quả để có thể tìm kiếm các mẫu cầu cơ bản
+    if len(historical_results) < 5: 
         return {"Ket_qua_du_doan": "Không đủ dữ liệu để phân tích cầu", "Ty_le_thang": "0%"}
 
-    # Reverse the list so the most recent result is at index 0
+    # Đảo ngược danh sách để kết quả gần nhất nằm ở đầu (index 0)
     recent_history = historical_results[::-1] 
     
-    # Simple pattern recognition
-    # Cầu Bệt (Consecutive results)
-    if len(recent_history) >= 3 and all(x == recent_history[0] for x in recent_history[:3]):
-        # If the last 3 results are the same (e.g., Tài-Tài-Tài)
-        # Predict the continuation of the "bệt"
-        return {
-            "Ket_qua_du_doan": recent_history[0], # Predicts Tài if last 3 were Tài
-            "Ty_le_thang": "70% (theo cầu bệt)" # Higher confidence for strong patterns
-        }
+    # --- Nhận diện các mẫu cầu ---
 
-    # Cầu Đảo (Alternating results)
-    if len(recent_history) >= 4 and \
-       recent_history[0] != recent_history[1] and \
-       recent_history[1] != recent_history[2] and \
-       recent_history[2] != recent_history[3]:
-        # If the last 4 results alternate (e.g., Tài-Xỉu-Tài-Xỉu)
-        # Predict the continuation of the alternating pattern
-        predicted = "Tài" if recent_history[0] == "Xỉu" else "Xỉu"
-        return {
-            "Ket_qua_du_doan": predicted, 
-            "Ty_le_thang": "65% (theo cầu đảo)"
-        }
+    # Cầu Bệt (Consecutive results) - ví dụ: Tài-Tài-Tài
+    # Kiểm tra 3, 4, 5... kết quả gần nhất
+    for i in range(3, len(recent_history) + 1):
+        current_sequence = recent_history[:i]
+        if all(x == current_sequence[0] for x in current_sequence):
+            # Nếu tìm thấy cầu bệt dài i
+            return {
+                "Ket_qua_du_doan": current_sequence[0], # Dự đoán tiếp tục bệt
+                "Ty_le_thang": f"{min(85, 50 + i * 5)}% (theo cầu bệt dài {i})" # Tỷ lệ tăng theo độ dài bệt
+            }
+
+    # Cầu Đảo (Alternating results) - ví dụ: Tài-Xỉu-Tài-Xỉu
+    if len(recent_history) >= 4:
+        is_alternating = True
+        for i in range(len(recent_history) - 1):
+            if recent_history[i] == recent_history[i+1]:
+                is_alternating = False
+                break
+        if is_alternating:
+            predicted = "Tài" if recent_history[0] == "Xỉu" else "Xỉu"
+            return {
+                "Ket_qua_du_doan": predicted, 
+                "Ty_le_thang": "65% (theo cầu đảo)"
+            }
     
-    # Cầu 1-2-1 (Một Tài, hai Xỉu, một Tài)
-    if len(recent_history) >= 4 and \
-       recent_history[0] == recent_history[2] and \
-       recent_history[1] == recent_history[3] and \
-       recent_history[0] != recent_history[1]:
-        # Example: Xỉu-Tài-Xỉu-Tài -> predict Xỉu
-        # Example: Tài-Xỉu-Tài-Xỉu -> predict Tài
-        predicted = recent_history[1] # Predict the one that appears twice
-        return {
-            "Ket_qua_du_doan": predicted,
-            "Ty_le_thang": "60% (theo cầu 1-2-1)"
-        }
+    # Cầu 1-2-1 / 1-1-2 / 2-1-1 (Một Tài, hai Xỉu, một Tài / Một Xỉu, hai Tài, một Xỉu)
+    # Ví dụ: Tài-Xỉu-Xỉu-Tài -> dự đoán Xỉu (vì có 2 Xỉu ở giữa)
+    if len(recent_history) >= 4:
+        # Mẫu A-B-B-A
+        if recent_history[0] == recent_history[3] and \
+           recent_history[1] == recent_history[2] and \
+           recent_history[0] != recent_history[1]:
+            # VD: Tài-Xỉu-Xỉu-Tài -> Dự đoán Xỉu (Tiếp tục cặp đôi ở giữa)
+            return {
+                "Ket_qua_du_doan": recent_history[1],
+                "Ty_le_thang": "60% (theo cầu 1-2-1/2-1-1)"
+            }
+        # Mẫu A-B-A-A
+        if recent_history[0] == recent_history[2] == recent_history[3] and \
+           recent_history[0] != recent_history[1]:
+            # VD: Tài-Xỉu-Tài-Tài -> Dự đoán Xỉu (Để tạo thành 2 Tài - 2 Xỉu)
+            return {
+                "Ket_qua_du_doan": recent_history[1],
+                "Ty_le_thang": "58% (theo cầu 1-1-2)"
+            }
 
-    # Fallback to simple majority prediction if no specific pattern is found
+
+    # --- Dự phòng: Dự đoán theo đa số nếu không tìm thấy cầu cụ thể ---
     tai_count = historical_results.count("Tài")
     xiu_count = historical_results.count("Xỉu")
     total_count = len(historical_results)
@@ -123,6 +149,7 @@ def analyze_patterns_and_predict(historical_results: List[str]) -> Dict[str, str
         predicted_outcome = "Xỉu"
         win_percentage = f"{(xiu_count / total_count) * 100:.0f}%"
     else:
+        # Nếu số lượng Tài và Xỉu bằng nhau, dự đoán ngẫu nhiên
         predicted_outcome = random.choice(["Tài", "Xỉu"])
         win_percentage = "50%"
 
@@ -205,9 +232,8 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
         else:
             current_phien_record = existing_phien
 
-        # Fetch more historical sessions for better pattern analysis (e.g., 50 or 100)
-        # I'll use 50 here. You can adjust this number.
-        HISTORY_LIMIT = 50 
+        # Lấy số lượng phiên lịch sử lớn hơn để phân tích cầu (ví dụ: 100 phiên)
+        HISTORY_LIMIT = 100 
         lich_su = db.query(PhienTaiXiu).order_by(PhienTaiXiu.phien_so_nguyen.desc()).limit(HISTORY_LIMIT).all()
         
         lich_su_formatted = [
@@ -222,12 +248,13 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
             } for p in lich_su
         ]
         
-        # Extract only the "Ket_qua" for pattern analysis
+        # Chỉ lấy kết quả "Tài" hoặc "Xỉu" để truyền vào hàm phân tích cầu
         historical_outcomes = [p["Ket_qua"] for p in lich_su_formatted]
 
-        # Predict based on pattern analysis
+        # Dự đoán dựa trên phân tích cầu
         prediction = analyze_patterns_and_predict(historical_outcomes)
 
+        # Trả về phản hồi API cuối cùng
         return {
             "Ket_qua": current_phien_record.ket_qua,
             "Phien": current_phien_record.expect_string,
@@ -236,7 +263,7 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
             "Xuc_xac_2": current_phien_record.xuc_xac_2,
             "Xuc_xac_3": current_phien_record.xuc_xac_3,
             "id": "Nhutquang", 
-            "Lich_su_gan_nhat": lich_su_formatted, # Renamed from "Lich_su_20_phien_gan_nhat" to be general
+            "Lich_su_gan_nhat": lich_su_formatted, 
             "Du_doan_phien_tiep_theo": prediction
         }
 
@@ -251,4 +278,5 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
             detail=f"Lỗi không xác định trong quá trình xử lý yêu cầu: {e}"
         )
 
-# To run locally: uvicorn main:app --reload
+# Để chạy cục bộ:
+# uvicorn main:app --reload
