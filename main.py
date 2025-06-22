@@ -1,26 +1,19 @@
 import os
 import random
-import httpx # Library for making HTTP requests
+import httpx
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
 from fastapi import FastAPI, Depends, HTTPException, status
-# Đã thêm BigInteger vào import
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, BigInteger 
-# Đã sửa lỗi cảnh báo: import declarative_base từ sqlalchemy.orm thay vì sqlalchemy.ext.declarative
+from sqlalchemy import create_engine, Column, Integer, String, DateTime 
 from sqlalchemy.orm import sessionmaker, Session, declarative_base 
-from sqlalchemy.exc import IntegrityError # To handle duplicate key errors
+from sqlalchemy.exc import IntegrityError 
 
 app = FastAPI()
 
 # --- Database Configuration (PostgreSQL) ---
-# Lấy chuỗi kết nối từ biến môi trường (cho Render)
-# Fallback (dự phòng) về một chuỗi kết nối PostgreSQL cục bộ hoặc SQLite cho phát triển cục bộ
-# Nếu bạn chạy cục bộ với PostgreSQL, hãy thay đổi "postgresql://user:password@localhost/taixiu_db" cho phù hợp
-# Nếu bạn muốn chạy cục bộ với SQLite và chấp nhận mất dữ liệu khi ứng dụng khởi động lại, hãy dùng: "sqlite:///./taixiu.db"
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/taixiu_db") 
 
-# Tạo engine và session maker
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 Base = declarative_base()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -30,10 +23,8 @@ class PhienTaiXiu(Base):
     __tablename__ = "phien_tai_xiu"
     
     id = Column(Integer, primary_key=True, index=True)
-    # expect_string từ API bên ngoài, dùng làm định danh duy nhất cho một phiên
+    # expect_string dùng làm định danh duy nhất cho một phiên và được lưu trữ
     expect_string = Column(String, unique=True, index=True, nullable=False) 
-    # ĐÃ THAY ĐỔI KIỂU DỮ LIỆU TỪ Integer SANG BigInteger
-    phien_so_nguyen = Column(BigInteger, index=True, nullable=False) 
     
     open_time = Column(DateTime)
     ket_qua = Column(String) # "Tài" or "Xỉu"
@@ -41,12 +32,11 @@ class PhienTaiXiu(Base):
     xuc_xac_1 = Column(Integer)
     xuc_xac_2 = Column(Integer)
     xuc_xac_3 = Column(Integer)
-    created_at = Column(DateTime, default=datetime.now) # Thời gian record được tạo trong DB của chúng ta
+    created_at = Column(DateTime, default=datetime.now) 
 
 # --- KHỞI TẠO BẢNG DATABASE (QUAN TRỌNG) ---
 # Uncomment dòng này VÀ CHẠY ỨNG DỤNG MỘT LẦN ĐỂ TẠO BẢNG trong cơ sở dữ liệu PostgreSQL của bạn.
 # SAU KHI BẢNG ĐƯỢC TẠO THÀNH CÔNG, HÃY COMMENT LẠI dòng này và triển khai lại.
-# Nếu bạn đang sử dụng SQLite, điều này cũng sẽ tạo file .db
 Base.metadata.create_all(bind=engine)
 
 # Dependency để lấy Session DB cho mỗi request
@@ -79,27 +69,19 @@ def analyze_patterns_and_predict(historical_results: List[str]) -> Dict[str, str
     Phân tích các mẫu "cầu" phổ biến trong lịch sử và đưa ra dự đoán.
     Đây là một ví dụ đơn giản tập trung vào các mẫu cầu cơ bản.
     """
-    # Cần ít nhất 5 kết quả để có thể tìm kiếm các mẫu cầu cơ bản
     if len(historical_results) < 5: 
         return {"Ket_qua_du_doan": "Không đủ dữ liệu để phân tích cầu", "Ty_le_thang": "0%"}
 
-    # Đảo ngược danh sách để kết quả gần nhất nằm ở đầu (index 0)
     recent_history = historical_results[::-1] 
     
-    # --- Nhận diện các mẫu cầu ---
-
-    # Cầu Bệt (Consecutive results) - ví dụ: Tài-Tài-Tài
-    # Kiểm tra 3, 4, 5... kết quả gần nhất
     for i in range(3, len(recent_history) + 1):
         current_sequence = recent_history[:i]
         if all(x == current_sequence[0] for x in current_sequence):
-            # Nếu tìm thấy cầu bệt dài i
             return {
-                "Ket_qua_du_doan": current_sequence[0], # Dự đoán tiếp tục bệt
-                "Ty_le_thang": f"{min(85, 50 + i * 5)}% (theo cầu bệt dài {i})" # Tỷ lệ tăng theo độ dài bệt
+                "Ket_qua_du_doan": current_sequence[0], 
+                "Ty_le_thang": f"{min(85, 50 + i * 5)}% (theo cầu bệt dài {i})"
             }
 
-    # Cầu Đảo (Alternating results) - ví dụ: Tài-Xỉu-Tài-Xỉu
     if len(recent_history) >= 4:
         is_alternating = True
         for i in range(len(recent_history) - 1):
@@ -113,29 +95,22 @@ def analyze_patterns_and_predict(historical_results: List[str]) -> Dict[str, str
                 "Ty_le_thang": "65% (theo cầu đảo)"
             }
     
-    # Cầu 1-2-1 / 1-1-2 / 2-1-1 (Một Tài, hai Xỉu, một Tài / Một Xỉu, hai Tài, một Xỉu)
-    # Ví dụ: Tài-Xỉu-Xỉu-Tài -> dự đoán Xỉu (vì có 2 Xỉu ở giữa)
     if len(recent_history) >= 4:
-        # Mẫu A-B-B-A
         if recent_history[0] == recent_history[3] and \
            recent_history[1] == recent_history[2] and \
            recent_history[0] != recent_history[1]:
-            # VD: Tài-Xỉu-Xỉu-Tài -> Dự đoán Xỉu (Tiếp tục cặp đôi ở giữa)
             return {
                 "Ket_qua_du_doan": recent_history[1],
                 "Ty_le_thang": "60% (theo cầu 1-2-1/2-1-1)"
             }
-        # Mẫu A-B-A-A
         if recent_history[0] == recent_history[2] == recent_history[3] and \
            recent_history[0] != recent_history[1]:
-            # VD: Tài-Xỉu-Tài-Tài -> Dự đoán Xỉu (Để tạo thành 2 Tài - 2 Xỉu)
             return {
                 "Ket_qua_du_doan": recent_history[1],
                 "Ty_le_thang": "58% (theo cầu 1-1-2)"
             }
 
 
-    # --- Dự phòng: Dự đoán theo đa số nếu không tìm thấy cầu cụ thể ---
     tai_count = historical_results.count("Tài")
     xiu_count = historical_results.count("Xỉu")
     total_count = len(historical_results)
@@ -150,7 +125,6 @@ def analyze_patterns_and_predict(historical_results: List[str]) -> Dict[str, str
         predicted_outcome = "Xỉu"
         win_percentage = f"{(xiu_count / total_count) * 100:.0f}%"
     else:
-        # Nếu số lượng Tài và Xỉu bằng nhau, dự đoán ngẫu nhiên
         predicted_outcome = random.choice(["Tài", "Xỉu"])
         win_percentage = "50%"
 
@@ -188,7 +162,6 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
     
     try:
         expect_str = str(data["Expect"])
-        phien_so_nguyen = int(expect_str) 
         
         open_code_str = data["OpenCode"]
         xuc_xac_values = [int(x.strip()) for x in open_code_str.split(',')]
@@ -201,12 +174,11 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
         current_phien_record: Optional[PhienTaiXiu] = None
 
         existing_phien = db.query(PhienTaiXiu).filter(
-            PhienTaiXiu.phien_so_nguyen == phien_so_nguyen
+            PhienTaiXiu.expect_string == expect_str 
         ).first()
         
         if not existing_phien:
             new_phien = PhienTaiXiu(
-                phien_so_nguyen=phien_so_nguyen,
                 expect_string=expect_str,
                 open_time=open_time_dt,
                 ket_qua=current_result_data["Ket_qua"],
@@ -222,13 +194,10 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
                 current_phien_record = new_phien
             except IntegrityError:
                 db.rollback()
-                # Nếu có lỗi trùng lặp, có thể do một request khác đã thêm vào trước
-                # Cố gắng truy vấn lại để lấy phiên đã tồn tại
                 current_phien_record = db.query(PhienTaiXiu).filter(
-                    PhienTaiXiu.phien_so_nguyen == phien_so_nguyen
+                    PhienTaiXiu.expect_string == expect_str 
                 ).first()
                 if not current_phien_record: 
-                    # Nếu vẫn không tìm thấy, có lỗi nghiêm trọng hơn
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         detail="Lỗi hệ thống: Không thể lưu hoặc truy xuất phiên mới sau lỗi trùng lặp."
@@ -237,10 +206,15 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
             current_phien_record = existing_phien
 
         # Lấy số lượng phiên lịch sử lớn hơn để phân tích cầu (ví dụ: 100 phiên)
-        HISTORY_LIMIT = 100 
-        lich_su = db.query(PhienTaiXiu).order_by(PhienTaiXiu.phien_so_nguyen.desc()).limit(HISTORY_LIMIT).all()
+        HISTORY_LIMIT_FOR_ANALYSIS = 100 
+        # Chỉ hiển thị 20 phiên gần nhất trong phản hồi API
+        DISPLAY_HISTORY_LIMIT = 20 
+
+        # Truy vấn 100 phiên để đảm bảo dữ liệu phân tích đầy đủ
+        lich_su = db.query(PhienTaiXiu).order_by(PhienTaiXiu.expect_string.desc()).limit(HISTORY_LIMIT_FOR_ANALYSIS).all()
         
-        lich_su_formatted = [
+        # Chỉ định dạng và lấy 20 phiên đầu tiên cho phần hiển thị
+        lich_su_formatted_full = [
             {
                 "Phien": p.expect_string, 
                 "Ket_qua": p.ket_qua,
@@ -251,23 +225,27 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
                 "OpenTime": p.open_time.strftime("%Y-%m-%d %H:%M:%S")
             } for p in lich_su
         ]
-        
-        # Chỉ lấy kết quả "Tài" hoặc "Xỉu" để truyền vào hàm phân tích cầu
-        historical_outcomes = [p["Ket_qua"] for p in lich_su_formatted]
+        # Cắt lấy 20 phiên gần nhất để hiển thị
+        lich_su_formatted_display = lich_su_formatted_full[:DISPLAY_HISTORY_LIMIT]
+
+        # Chỉ lấy kết quả "Tài" hoặc "Xỉu" từ TẤT CẢ 100 phiên để truyền vào hàm phân tích cầu
+        historical_outcomes_for_analysis = [p["Ket_qua"] for p in lich_su_formatted_full]
 
         # Dự đoán dựa trên phân tích cầu
-        prediction = analyze_patterns_and_predict(historical_outcomes)
+        prediction = analyze_patterns_and_predict(historical_outcomes_for_analysis)
 
         # Trả về phản hồi API cuối cùng
         return {
-            "Ket_qua": current_phien_record.ket_qua,
-            "Phien": current_phien_record.expect_string,
-            "Tong": current_phien_record.tong,
-            "Xuc_xac_1": current_phien_record.xuc_xac_1,
-            "Xuc_xac_2": current_phien_record.xuc_xac_2,
-            "Xuc_xac_3": current_phien_record.xuc_xac_3,
-            "id": "Nhutquang", 
-            "Lich_su_gan_nhat": lich_su_formatted, 
+            "Ket_qua_phien_hien_tai": current_phien_record.ket_qua,
+            "Ma_phien_hien_tai": current_phien_record.expect_string,
+            "Tong_diem_hien_tai": current_phien_record.tong,
+            "Xuc_xac_hien_tai": [
+                current_phien_record.xuc_xac_1,
+                current_phien_record.xuc_xac_2,
+                current_phien_record.xuc_xac_3
+            ],
+            "admin_name": "Nhutquang", # Đổi key từ "id" sang "admin_name"
+            "Lich_su_gan_nhat": lich_su_formatted_display, # Chỉ hiển thị 20 phiên
             "Du_doan_phien_tiep_theo": prediction
         }
 
@@ -282,5 +260,3 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
             detail=f"Lỗi không xác định trong quá trình xử lý yêu cầu: {e}"
         )
 
-# Để chạy cục bộ:
-# uvicorn main:app --reload
