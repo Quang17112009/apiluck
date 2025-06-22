@@ -1,9 +1,9 @@
 import os
 import asyncio
-import random # Vẫn giữ để fallback hoặc cho trường hợp 50%
+import random
 import httpx
-import joblib # Để tải mô hình ML
-import pandas as pd # Để làm việc với DataFrame khi trích xuất features
+import joblib
+import pandas as pd
 from datetime import datetime, timedelta
 from typing import List, Dict
 
@@ -11,9 +11,10 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy import create_engine
 
-# Import các thành phần từ các file bạn đã tạo
-from .database import Base, get_db, PhienTaiXiu # database.py
-from .features import extract_features, FEATURE_COLUMNS # features.py (Đảm bảo import FEATURE_COLUMNS)
+# Đã thay đổi từ .database thành database
+from database import Base, get_db, PhienTaiXiu
+# Đã thay đổi từ .features thành features
+from features import extract_features, FEATURE_COLUMNS
 
 # --- Cấu hình Database ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -22,15 +23,13 @@ if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable is not set. Please set it for Render deployment.")
 
 engine = create_engine(DATABASE_URL)
-# Đảm bảo bảng được tạo nếu chưa có.
-# Trong môi trường production, thường sẽ dùng Alembic hoặc cách quản lý migration khác.
 Base.metadata.create_all(bind=engine) 
 
 app = FastAPI()
 
 # --- Tải Mô hình Học máy ---
 ml_model = None
-MODEL_PATH = 'model.pkl' # Tên file mô hình đã lưu, phải nằm cùng cấp với main.py khi deploy
+MODEL_PATH = 'model.pkl'
 
 try:
     if os.path.exists(MODEL_PATH):
@@ -40,22 +39,22 @@ try:
         print(f"Cảnh báo: Không tìm thấy file mô hình '{MODEL_PATH}'. Dự đoán sẽ sử dụng logic thống kê cũ.")
 except Exception as e:
     print(f"Lỗi khi tải mô hình: {e}. Dự đoán sẽ sử dụng logic thống kê cũ.")
-    ml_model = None # Đảm bảo mô hình bị vô hiệu hóa nếu có lỗi tải
+    ml_model = None
 
 # --- Hằng số ---
-EXTERNAL_API_URL = "https://www.1.bot/api/data?type=cq" # URL API ngoài để lấy dữ liệu
-FETCH_INTERVAL_SECONDS = 5 # Khoảng thời gian giữa các lần fetch data (có thể điều chỉnh)
-HISTORY_LIMIT_FOR_ANALYSIS = 100 # Số phiên lịch sử để lấy cho phân tích dự đoán
+EXTERNAL_API_URL = "https://www.1.bot/api/data?type=cq"
+FETCH_INTERVAL_SECONDS = 5
+HISTORY_LIMIT_FOR_ANALYSIS = 100
 
 # --- Background Task để fetch dữ liệu từ API ngoài và lưu vào DB ---
 async def fetch_data_from_external_api_in_background():
     print("Bắt đầu tác vụ nền fetch dữ liệu...")
     while True:
-        db: Session = next(get_db()) # Lấy session DB mới cho mỗi vòng lặp
+        db: Session = next(get_db())
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(EXTERNAL_API_URL, timeout=10.0)
-                response.raise_for_status() # Ném lỗi nếu status code là 4xx/5xx
+                response.raise_for_status()
                 data = response.json()
 
                 for item in data.get("list", []):
@@ -64,7 +63,6 @@ async def fetch_data_from_external_api_in_background():
                     kai_jiang_time_str = item.get("kaiJiangTime")
 
                     if not expect_string or not open_code or not kai_jiang_time_str:
-                        # print(f"Dữ liệu thiếu ở item: {item}. Bỏ qua.") # Bỏ comment để debug
                         continue
 
                     try:
@@ -75,7 +73,6 @@ async def fetch_data_from_external_api_in_background():
 
                     existing_phien = db.query(PhienTaiXiu).filter(PhienTaiXiu.expect_string == expect_string).first()
                     if existing_phien:
-                        # print(f"Session {expect_string} đã tồn tại.") # Bỏ comment để debug
                         continue
 
                     try:
@@ -108,9 +105,9 @@ async def fetch_data_from_external_api_in_background():
         except Exception as e:
             print(f"Lỗi không xác định trong tác vụ nền fetch_data: {e}")
         finally:
-            db.close() # Đảm bảo đóng session
+            db.close()
 
-        await asyncio.sleep(FETCH_INTERVAL_SECONDS) # Đợi trước khi fetch lại
+        await asyncio.sleep(FETCH_INTERVAL_SECONDS)
 
 # --- Khởi chạy Background Task khi ứng dụng khởi động ---
 @app.on_event("startup")
@@ -122,7 +119,6 @@ async def startup_event():
 async def get_prediction(db: Session = Depends(get_db)):
     current_time = datetime.now()
     
-    # 1. Lấy thông tin phiên mới nhất từ database của bạn
     latest_phien = db.query(PhienTaiXiu).order_by(PhienTaiXiu.expect_string.desc()).first()
     
     phien_hien_tai_info = {}
@@ -137,37 +133,25 @@ async def get_prediction(db: Session = Depends(get_db)):
     else:
         phien_hien_tai_info = {"ThongBao": "Chưa có dữ liệu phiên nào được xử lý hoặc lưu vào database."}
 
-    # 2. Lấy lịch sử để đưa vào mô hình dự đoán
-    # Sắp xếp theo expect_string giảm dần để có lịch sử từ MỚI NHẤT -> CŨ NHẤT
     historical_records = db.query(PhienTaiXiu).order_by(PhienTaiXiu.expect_string.desc()).limit(HISTORY_LIMIT_FOR_ANALYSIS).all()
-    # Chuyển đổi list of PhienTaiXiu objects thành list of strings ('Tài'/'Xỉu')
-    # Filter out None values in ket_qua_phien if any
     historical_results_strings = [rec.ket_qua_phien for rec in historical_records if rec.ket_qua_phien]
 
     du_doan_phien_tiep_theo = {}
 
     if ml_model and historical_results_strings:
         try:
-            # Tạo tính năng cho dự đoán từ lịch sử hiện có
             features_for_prediction_df = extract_features(historical_results_strings)
             
-            # Đảm bảo các cột của features_for_prediction_df khớp với các cột mà mô hình mong đợi (FEATURE_COLUMNS)
             if not features_for_prediction_df.empty and list(features_for_prediction_df.columns) == FEATURE_COLUMNS:
-                # Thực hiện dự đoán bằng mô hình ML
                 predicted_label = ml_model.predict(features_for_prediction_df)[0]
                 
-                # Lấy xác suất dự đoán (đây chính là "tỷ lệ thắng thực tế" bạn muốn)
                 predicted_proba = ml_model.predict_proba(features_for_prediction_df)[0]
                 
-                # Tìm xác suất của nhãn được dự đoán
-                # ml_model.classes_ là mảng chứa các nhãn mà mô hình đã được huấn luyện ('Tài', 'Xỉu')
                 try:
-                    # Chuyển đổi classes_ sang list để tìm index an toàn
                     label_index = ml_model.classes_.tolist().index(predicted_label)
                     predicted_prob_value = predicted_proba[label_index]
                     win_percentage_str = f"{predicted_prob_value * 100:.0f}% (từ mô hình ML)"
                 except ValueError: 
-                    # Xử lý trường hợp nhãn dự đoán không có trong ml_model.classes_ (hiếm khi xảy ra nếu model tốt)
                     print(f"Cảnh báo: Nhãn dự đoán '{predicted_label}' không tìm thấy trong classes_ của mô hình.")
                     win_percentage_str = "N/A (lỗi xác suất)"
                 
@@ -183,8 +167,6 @@ async def get_prediction(db: Session = Depends(get_db)):
             print(f"Lỗi khi dự đoán bằng mô hình ML: {e}. Fallback logic thống kê cũ.")
             du_doan_phien_tiep_theo = fallback_prediction_logic(historical_results_strings)
     else:
-        # Fallback về logic thống kê cũ nếu không có mô hình (chưa train hoặc lỗi tải)
-        # hoặc không có đủ lịch sử để tạo features.
         du_doan_phien_tiep_theo = fallback_prediction_logic(historical_results_strings)
 
     return {
@@ -195,9 +177,6 @@ async def get_prediction(db: Session = Depends(get_db)):
     }
 
 def fallback_prediction_logic(historical_results: List[str]) -> Dict[str, str]:
-    """
-    Logic dự đoán cũ (thống kê chung) được sử dụng làm phương án dự phòng.
-    """
     tai_count = historical_results.count("Tài")
     xiu_count = historical_results.count("Xỉu")
     total_count = len(historical_results)
@@ -211,9 +190,8 @@ def fallback_prediction_logic(historical_results: List[str]) -> Dict[str, str]:
     elif xiu_count > tai_count:
         predicted_outcome = "Xỉu"
         win_percentage = f"{(xiu_count / total_count) * 100:.0f}% (thống kê chung)"
-    else: # Số lượng bằng nhau, chọn ngẫu nhiên
+    else:
         predicted_outcome = random.choice(["Tài", "Xỉu"])
         win_percentage = "50% (thống kê chung)"
 
     return {"Ket_qua_du_doan": predicted_outcome, "Ty_le_thang": win_percentage}
-
