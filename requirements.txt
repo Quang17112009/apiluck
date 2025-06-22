@@ -3,3 +3,7 @@ uvicorn
 sqlalchemy
 psycopg2-binary
 httpx
+asyncio
+pandas
+scikit-learn
+joblib
