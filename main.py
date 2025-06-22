@@ -1,203 +1,255 @@
 import os
-import asyncio
 import random
 import httpx
-import joblib
-import pandas as pd
-from datetime import datetime, timedelta
-from typing import List, Dict
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
 
 from fastapi import FastAPI, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy.orm import sessionmaker, Session, declarative_base
+from sqlalchemy.exc import IntegrityError
 
-# Đã thay đổi từ .database thành database để khắc phục ImportError
-from database import Base, get_db, PhienTaiXiu
-# Đã thay đổi từ .features thành features để khắc phục ImportError
-from features import extract_features, FEATURE_COLUMNS
-
-# --- Cấu hình Database ---
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable is not set. Please set it for Render deployment.")
-
-engine = create_engine(DATABASE_URL)
-# Đảm bảo bảng được tạo nếu chưa có.
-Base.metadata.create_all(bind=engine) 
+# --- Machine Learning Imports ---
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+import numpy as np
 
 app = FastAPI()
 
-# --- Tải Mô hình Học máy ---
-ml_model = None
-MODEL_PATH = 'model.pkl'
+# --- Database Configuration (PostgreSQL) ---
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/taixiu_db")
 
-try:
-    if os.path.exists(MODEL_PATH):
-        ml_model = joblib.load(MODEL_PATH)
-        print("Mô hình học máy đã được tải thành công.")
-    else:
-        print(f"Cảnh báo: Không tìm thấy file mô hình '{MODEL_PATH}'. Dự đoán sẽ sử dụng logic thống kê cũ.")
-except Exception as e:
-    print(f"Lỗi khi tải mô hình: {e}. Dự đoán sẽ sử dụng logic thống kê cũ.")
-    ml_model = None
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+Base = declarative_base()
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# --- Hằng số ---
-EXTERNAL_API_URL = "https://www.1.bot/api/data?type=cq"
-FETCH_INTERVAL_SECONDS = 5
-HISTORY_LIMIT_FOR_ANALYSIS = 100
+# --- Database Model Definition ---
+class PhienTaiXiu(Base):
+    __tablename__ = "phien_tai_xiu"
 
-# --- Background Task để fetch dữ liệu từ API ngoài và lưu vào DB ---
-async def fetch_data_from_external_api_in_background():
-    print("Bắt đầu tác vụ nền fetch dữ liệu...")
-    while True:
-        db: Session = next(get_db())
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(EXTERNAL_API_URL, timeout=10.0)
-                response.raise_for_status()
-                data = response.json()
+    id = Column(Integer, primary_key=True, index=True)
+    expect_string = Column(String, unique=True, index=True, nullable=False)
+    open_time = Column(DateTime)
+    ket_qua = Column(String) # "Tài" or "Xỉu"
+    tong = Column(Integer)
+    xuc_xac_1 = Column(Integer)
+    xuc_xac_2 = Column(Integer)
+    xuc_xac_3 = Column(Integer)
+    created_at = Column(DateTime, default=datetime.now)
 
-                for item in data.get("list", []):
-                    expect_string = item.get("expect")
-                    open_code = item.get("openCode")
-                    kai_jiang_time_str = item.get("kaiJiangTime")
+# --- KHỞI TẠO BẢNG DATABASE (QUAN TRỌNG) ---
+# Uncomment dòng này VÀ CHẠY ỨNG DỤNG MỘT LẦN ĐỂ TẠO BẢNG trong cơ sở dữ liệu PostgreSQL của bạn.
+# SAU KHI BẢNG ĐƯỢC TẠO THÀNH CÔNG, HÃY COMMENT LẠI dòng này và triển khai lại.
+# Base.metadata.create_all(bind=engine)
 
-                    if not expect_string or not open_code or not kai_jiang_time_str:
-                        continue
+# Dependency để lấy Session DB cho mỗi request
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-                    try:
-                        # API có thể trả về timestamp dưới dạng chuỗi, cần đảm bảo đúng kiểu
-                        kai_jiang_time = datetime.fromtimestamp(int(kai_jiang_time_str) / 1000)
-                    except (ValueError, TypeError):
-                        print(f"Lỗi chuyển đổi kaiJiangTime: {kai_jiang_time_str}. Bỏ qua.")
-                        continue
+# --- Logic tính Tài Xỉu ---
+def get_tai_xiu_result(xuc_xac_values: List[int]) -> Dict[str, any]:
+    """Tính toán kết quả Tài/Xỉu từ 3 giá trị xúc xắc."""
+    if len(xuc_xac_values) != 3:
+        raise ValueError("Phải có đúng 3 giá trị xúc xắc.")
 
-                    existing_phien = db.query(PhienTaiXiu).filter(PhienTaiXiu.expect_string == expect_string).first()
-                    if existing_phien:
-                        continue
+    x1, x2, x3 = xuc_xac_values
+    tong = x1 + x2 + x3
+    ket_qua = "Tài" if 11 <= tong <= 17 else "Xỉu" # Tài: 11-17, Xỉu: 4-10
 
-                    try:
-                        dice_results = [int(d) for d in open_code.split(',') if d.strip().isdigit()]
-                        if len(dice_results) != 3:
-                            raise ValueError("openCode không có đủ 3 viên xúc xắc hợp lệ.")
-                        
-                        tong_diem = sum(dice_results)
-                        ket_qua_phien = "Tài" if tong_diem >= 11 else "Xỉu"
-                    except (ValueError, IndexError):
-                        print(f"Lỗi phân tích openCode: '{open_code}'. Bỏ qua.")
-                        continue
+    # Quy tắc cho "Bão" (bộ 3 đồng nhất) - thường được coi là Xỉu
+    if x1 == x2 == x3:
+        ket_qua = "Xỉu" # Bộ 3 đồng nhất (ví dụ: 1-1-1, 6-6-6) được coi là Xỉu
 
-                    new_phien = PhienTaiXiu(
-                        expect_string=expect_string,
-                        open_code=open_code,
-                        kai_jiang_time=kai_jiang_time,
-                        ket_qua_phien=ket_qua_phien,
-                        tong_diem=tong_diem,
-                    )
-                    db.add(new_phien)
-                    db.commit()
-                    db.refresh(new_phien)
-                    print(f"Đã lưu phiên {new_phien.expect_string} vào DB. Kết quả: {new_phien.ket_qua_phien}, Tổng: {new_phien.tong_diem}")
+    return {"Tong": tong, "Xuc_xac_1": x1, "Xuc_xac_2": x2, "Xuc_xac_3": x3, "Ket_qua": ket_qua}
 
-        except httpx.RequestError as exc:
-            print(f"Lỗi kết nối API ngoài: {exc}")
-        except httpx.HTTPStatusError as exc:
-            print(f"Lỗi HTTP từ API ngoài: Status {exc.response.status_code} - {exc.response.text}")
-        except Exception as e:
-            print(f"Lỗi không xác định trong tác vụ nền fetch_data: {e}")
-        finally:
-            db.close()
+# --- Machine Learning Model for Prediction ---
+def predict_with_ml_model(historical_results: List[str]) -> Dict[str, str]:
+    """
+    Sử dụng mô hình học máy để dự đoán kết quả Tài/Xỉu và độ tin cậy.
+    """
+    if len(historical_results) < 20: # Cần nhiều dữ liệu hơn để huấn luyện mô hình
+        return {"Ket_qua_du_doan": "Không đủ dữ liệu để huấn luyện ML", "Do_tin_cay": "N/A"}
 
-        await asyncio.sleep(FETCH_INTERVAL_SECONDS)
+    # Encode "Tài" và "Xỉu" thành số
+    le = LabelEncoder()
+    encoded_results = le.fit_transform(historical_results) # Tài -> 1, Xỉu -> 0 (hoặc ngược lại)
 
-# --- Khởi chạy Background Task khi ứng dụng khởi động ---
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(fetch_data_from_external_api_in_background())
+    # Chuẩn bị dữ liệu cho mô hình
+    # Chúng ta sẽ sử dụng một "cửa sổ" các kết quả trước đó để dự đoán kết quả tiếp theo.
+    # Ví dụ: dùng 5 kết quả trước để dự đoán kết quả thứ 6.
+    window_size = 5 # Số lượng kết quả lịch sử để xem xét cho mỗi dự đoán
+    X = [] # Features
+    y = [] # Labels
 
-# --- API Endpoint để lấy dữ liệu và đưa ra dự đoán ---
-@app.get("/api/taixiu")
-async def get_prediction(db: Session = Depends(get_db)):
-    current_time = datetime.now()
-    
-    # 1. Lấy thông tin phiên mới nhất từ database của bạn
-    # Sử dụng kai_jiang_time để sắp xếp, an toàn hơn và chính xác hơn cho thời gian
-    latest_phien = db.query(PhienTaiXiu).order_by(PhienTaiXiu.kai_jiang_time.desc()).first()
-    
-    phien_hien_tai_info = {}
-    if latest_phien:
-        phien_hien_tai_info = {
-            "Expect": latest_phien.expect_string,
-            "OpenCode": latest_phien.open_code,
-            "KaiJiangTime": latest_phien.kai_jiang_time.isoformat(),
-            "KetQuaPhien": latest_phien.ket_qua_phien,
-            "TongDiem": latest_phien.tong_diem,
+    for i in range(len(encoded_results) - window_size):
+        X.append(encoded_results[i : i + window_size])
+        y.append(encoded_results[i + window_size])
+
+    if not X: # Trường hợp không đủ dữ liệu sau khi tạo cửa sổ
+        return {"Ket_qua_du_doan": "Không đủ dữ liệu sau khi tạo cửa sổ ML", "Do_tin_cay": "N/A"}
+
+    X = np.array(X)
+    y = np.array(y)
+
+    # Chia dữ liệu thành tập huấn luyện và tập kiểm tra (tùy chọn, ở đây ta huấn luyện trên toàn bộ)
+    # For a simple online prediction, we might train on all available data
+    # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    try:
+        model = LogisticRegression(solver='liblinear', random_state=42)
+        model.fit(X, y)
+
+        # Dự đoán cho phiên tiếp theo
+        # Lấy 5 kết quả gần nhất để làm đầu vào cho dự đoán
+        last_n_results = encoded_results[-window_size:].reshape(1, -1)
+        
+        predicted_encoded = model.predict(last_n_results)[0]
+        predicted_outcome = le.inverse_transform([predicted_encoded])[0]
+
+        # Lấy xác suất dự đoán
+        probabilities = model.predict_proba(last_n_results)[0]
+        confidence = probabilities[model.classes_ == predicted_encoded][0] * 100 # Chuyển đổi thành %
+
+        return {
+            "Ket_qua_du_doan": predicted_outcome,
+            "Do_tin_cay": f"{confidence:.2f}%"
         }
-    else:
-        phien_hien_tai_info = {"ThongBao": "Chưa có dữ liệu phiên nào được xử lý hoặc lưu vào database."}
+    except Exception as e:
+        print(f"Error during ML prediction: {e}")
+        return {"Ket_qua_du_doan": "Lỗi khi chạy mô hình ML", "Do_tin_cay": "N/A"}
 
-    # 2. Lấy lịch sử để đưa vào mô hình dự đoán
-    # Sử dụng kai_jiang_time để sắp xếp lịch sử từ MỚI NHẤT -> CŨ NHẤT
-    historical_records = db.query(PhienTaiXiu).order_by(PhienTaiXiu.kai_jiang_time.desc()).limit(HISTORY_LIMIT_FOR_ANALYSIS).all()
-    historical_results_strings = [rec.ket_qua_phien for rec in historical_records if rec.ket_qua_phien]
 
-    du_doan_phien_tiep_theo = {}
+# --- Main API Endpoint ---
+@app.get("/api/taixiu")
+async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_db)):
+    EXTERNAL_API_URL = "https://1.bot/GetNewLottery/LT_Taixiu" # This URL is likely a placeholder/example
 
-    if ml_model and historical_results_strings:
-        try:
-            features_for_prediction_df = extract_features(historical_results_strings)
-            
-            if not features_for_prediction_df.empty and list(features_for_prediction_df.columns) == FEATURE_COLUMNS:
-                predicted_label = ml_model.predict(features_for_prediction_df)[0]
-                
-                predicted_proba = ml_model.predict_proba(features_for_prediction_df)[0]
-                
-                try:
-                    label_index = ml_model.classes_.tolist().index(predicted_label)
-                    predicted_prob_value = predicted_proba[label_index]
-                    win_percentage_str = f"{predicted_prob_value * 100:.0f}% (từ mô hình ML)"
-                except ValueError: 
-                    print(f"Cảnh báo: Nhãn dự đoán '{predicted_label}' không tìm thấy trong classes_ của mô hình.")
-                    win_percentage_str = "N/A (lỗi xác suất)"
-                
-                du_doan_phien_tiep_theo = {
-                    "Ket_qua_du_doan": predicted_label,
-                    "Ty_le_thang": win_percentage_str
-                }
-            else:
-                print("Cảnh báo: DataFrame tính năng rỗng hoặc không khớp cột. Fallback logic thống kê cũ.")
-                du_doan_phien_tiep_theo = fallback_prediction_logic(historical_results_strings)
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(EXTERNAL_API_URL, timeout=10.0)
+            response.raise_for_status()
+            external_data = response.json()
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi kết nối đến API bên ngoài: {exc}. Vui lòng thử lại sau."
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi xử lý phản hồi từ API bên ngoài: {e}"
+        )
 
-        except Exception as e:
-            print(f"Lỗi khi dự đoán bằng mô hình ML: {e}. Fallback logic thống kê cũ.")
-            du_doan_phien_tiep_theo = fallback_prediction_logic(historical_results_strings)
-    else:
-        du_doan_phien_tiep_theo = fallback_prediction_logic(historical_results_strings)
+    if external_data.get("state") != 1 or not external_data.get("data"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Dữ liệu từ API bên ngoài không hợp lệ hoặc không có kết quả."
+        )
 
-    return {
-        "status": "success",
-        "current_time": current_time.isoformat(),
-        "phien_hien_tai": phien_hien_tai_info,
-        "Du_doan_phien_tiep_theo": du_doan_phien_tiep_theo
-    }
+    data = external_data["data"]
 
-def fallback_prediction_logic(historical_results: List[str]) -> Dict[str, str]:
-    tai_count = historical_results.count("Tài")
-    xiu_count = historical_results.count("Xỉu")
-    total_count = len(historical_results)
+    try:
+        expect_str = str(data["Expect"])
 
-    if total_count == 0:
-        return {"Ket_qua_du_doan": "Không có dữ liệu", "Ty_le_thang": "0% (thống kê chung)"}
+        open_code_str = data["OpenCode"]
+        xuc_xac_values = [int(x.strip()) for x in open_code_str.split(',')]
 
-    if tai_count > xiu_count:
-        predicted_outcome = "Tài"
-        win_percentage = f"{(tai_count / total_count) * 100:.0f}% (thống kê chung)"
-    elif xiu_count > tai_count:
-        predicted_outcome = "Xỉu"
-        win_percentage = f"{(xiu_count / total_count) * 100:.0f}% (thống kê chung)"
-    else:
-        predicted_outcome = random.choice(["Tài", "Xỉu"])
-        win_percentage = "50% (thống kê chung)"
+        open_time_str = data["OpenTime"]
+        open_time_dt = datetime.strptime(open_time_str, "%Y-%m-%d %H:%M:%S")
 
-    return {"Ket_qua_du_doan": predicted_outcome, "Ty_le_thang": win_percentage}
+        current_result_data = get_tai_xiu_result(xuc_xac_values)
+
+        current_phien_record: Optional[PhienTaiXiu] = None
+
+        existing_phien = db.query(PhienTaiXiu).filter(
+            PhienTaiXiu.expect_string == expect_str
+        ).first()
+
+        if not existing_phien:
+            new_phien = PhienTaiXiu(
+                expect_string=expect_str,
+                open_time=open_time_dt,
+                ket_qua=current_result_data["Ket_qua"],
+                tong=current_result_data["Tong"],
+                xuc_xac_1=current_result_data["Xuc_xac_1"],
+                xuc_xac_2=current_result_data["Xuc_xac_2"],
+                xuc_xac_3=current_result_data["Xuc_xac_3"]
+            )
+            db.add(new_phien)
+            try:
+                db.commit()
+                db.refresh(new_phien)
+                current_phien_record = new_phien
+            except IntegrityError:
+                db.rollback()
+                current_phien_record = db.query(PhienTaiXiu).filter(
+                    PhienTaiXiu.expect_string == expect_str
+                ).first()
+                if not current_phien_record:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Lỗi hệ thống: Không thể lưu hoặc truy xuất phiên mới sau lỗi trùng lặp."
+                    )
+        else:
+            current_phien_record = existing_phien
+
+        # Lấy số lượng phiên lịch sử lớn hơn để phân tích cầu và ML (ví dụ: 200 phiên trở lên)
+        HISTORY_LIMIT_FOR_ANALYSIS = 200
+        # Chỉ hiển thị 20 phiên gần nhất trong phản hồi API
+        DISPLAY_HISTORY_LIMIT = 20
+
+        # Truy vấn các phiên để đảm bảo dữ liệu phân tích đầy đủ
+        lich_su = db.query(PhienTaiXiu).order_by(PhienTaiXiu.expect_string.desc()).limit(HISTORY_LIMIT_FOR_ANALYSIS).all()
+
+        # Chỉ định dạng và lấy 20 phiên đầu tiên cho phần hiển thị
+        lich_su_formatted_full = [
+            {
+                "Phien": p.expect_string,
+                "Ket_qua": p.ket_qua,
+                "Tong": p.tong,
+                "Xuc_xac_1": p.xuc_xac_1,
+                "Xuc_xac_2": p.xuc_xac_2,
+                "Xuc_xac_3": p.xuc_xac_3,
+                "OpenTime": p.open_time.strftime("%Y-%m-%d %H:%M:%S")
+            } for p in lich_su
+        ]
+        # Cắt lấy 20 phiên gần nhất để hiển thị
+        lich_su_formatted_display = lich_su_formatted_full[:DISPLAY_HISTORY_LIMIT]
+
+        # Chỉ lấy kết quả "Tài" hoặc "Xỉu" từ TẤT CẢ các phiên để truyền vào hàm ML
+        historical_outcomes_for_analysis = [p["Ket_qua"] for p in lich_su_formatted_full]
+
+        # Dự đoán dựa trên mô hình học máy
+        ml_prediction = predict_with_ml_model(historical_outcomes_for_analysis)
+
+        # Trả về phản hồi API cuối cùng
+        return {
+            "Ket_qua_phien_hien_tai": current_phien_record.ket_qua,
+            "Ma_phien_hien_tai": current_phien_record.expect_string,
+            "Tong_diem_hien_tai": current_phien_record.tong,
+            "Xuc_xac_hien_tai": [
+                current_phien_record.xuc_xac_1,
+                current_phien_record.xuc_xac_2,
+                current_phien_record.xuc_xac_3
+            ],
+            "admin_name": "Nhutquang",
+            "Lich_su_gan_nhat": lich_su_formatted_display,
+            "Du_doan_phien_tiep_theo_ML": ml_prediction # Đã đổi tên để rõ ràng hơn
+        }
+
+    except (KeyError, ValueError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Dữ liệu từ API bên ngoài không đúng định dạng hoặc thiếu trường bắt buộc: {e}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi không xác định trong quá trình xử lý yêu cầu: {e}"
+        )
+
