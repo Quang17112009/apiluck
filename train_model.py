@@ -7,9 +7,9 @@ import os
 from datetime import datetime
 import sys
 
-# Đã thay đổi từ .database thành database
+# Đã thay đổi từ .database thành database để khắc phục ImportError
 from database import SessionLocal, PhienTaiXiu, Base, engine
-# Đã thay đổi từ .features thành features
+# Đã thay đổi từ .features thành features để khắc phục ImportError
 from features import create_training_data, FEATURE_COLUMNS
 
 def get_db_session():
@@ -31,7 +31,9 @@ def train_and_save_model():
     db = next(db_gen)
 
     try:
-        all_historical_records_db = db.query(PhienTaiXiu).order_by(PhienTaiXiu.expect_string.desc()).all()
+        # Lấy tất cả dữ liệu lịch sử từ database
+        # Sử dụng kai_jiang_time để sắp xếp lịch sử từ MỚI NHẤT -> CŨ NHẤT
+        all_historical_records_db = db.query(PhienTaiXiu).order_by(PhienTaiXiu.kai_jiang_time.desc()).all()
         all_historical_results_strings = [rec.ket_qua_phien for rec in all_historical_records_db if rec.ket_qua_phien]
 
         if not all_historical_results_strings:
