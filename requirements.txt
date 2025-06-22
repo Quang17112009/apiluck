@@ -1,8 +1,7 @@
 fastapi
-uvicorn[standard]
+uvicorn
 sqlalchemy
 psycopg2-binary
 httpx
-pandas
 scikit-learn
-joblib
+numpy
