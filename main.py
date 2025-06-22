@@ -1,227 +1,254 @@
-import telebot
+import os
 import random
-import string
-import json
-from keep_alive import keep_alive
+import httpx
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
 
-keep_alive()
+from fastapi import FastAPI, Depends, HTTPException, status
+from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import IntegrityError
 
-BOT_TOKEN = "8024432209:AAF9B1FWDswoGjnHnGKnKLiT4-zXSe6Buc4"
-ADMIN_IDS = [6915752059]
-bot = telebot.TeleBot(BOT_TOKEN)
+app = FastAPI()
 
-history = []
-profit = 0
-user_turns = {}
-DATA_FILE = "data.json"
+# --- Database Configuration (PostgreSQL) ---
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/taixiu_db") 
 
-def generate_nap_code():
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+Base = declarative_base()
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-def analyze_md5(md5_hash):
-    global history
+# --- Database Model Definition ---
+class PhienTaiXiu(Base):
+    __tablename__ = "phien_tai_xiu"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    expect_string = Column(String, unique=True, index=True, nullable=False) 
+    phien_so_nguyen = Column(Integer, index=True, nullable=False) 
+    
+    open_time = Column(DateTime)
+    ket_qua = Column(String) # "Tài" or "Xỉu"
+    tong = Column(Integer)
+    xuc_xac_1 = Column(Integer)
+    xuc_xac_2 = Column(Integer)
+    xuc_xac_3 = Column(Integer)
+    created_at = Column(DateTime, default=datetime.now) 
 
-    algo1 = int(md5_hash[-2:], 16) % 2
-    result1 = "Tài" if algo1 == 0 else "Xỉu"
-
-    total_hex = sum(int(md5_hash[i:i+2], 16) for i in range(0, 8, 2))
-    result2 = "Tài" if total_hex % 2 == 0 else "Xỉu"
-
-    full_sum = sum(int(md5_hash[i:i+2], 16) for i in range(0, 32, 2))
-    result3 = "Tài" if full_sum % 5 < 3 else "Xỉu"
-
-    results = [result1, result2, result3]
-    final_result = max(set(results), key=results.count)
-
-    prediction = {
-        "md5": md5_hash,
-        "dự đoán": final_result,
-        "thuật toán": {
-            "thuật toán 1": result1,
-            "thuật toán 2": result2,
-            "thuật toán 3": result3,
-        },
-        "kết quả thực tế": None
-    }
-    history.append(prediction)
-
-    return (f"✅ KẾT QUẢ PHÂN TÍCH PHIÊN TÀI XỈU MD5:\n"
-            f"🔹 MD5: {md5_hash}\n\n"
-            f"📊 Kết quả theo từng thuật toán:\n"
-            f"   - Thuật toán 1 (2 ký tự cuối): {result1}\n"
-            f"   - Thuật toán 2 (4 byte đầu): {result2}\n"
-            f"   - Thuật toán 3 (Tổng toàn MD5): {result3}\n\n"
-            f"✅ Kết luận cuối cùng: {final_result} | 🎯 Tín hiệu mạnh!\n"
-            f"💡 Gợi ý: Cầu {final_result} đang lên mạnh!")
-
-def save_data():
-    with open(DATA_FILE, "w") as f:
-        json.dump({"user_turns": user_turns, "history": history, "profit": profit}, f)
-
-def load_data():
-    global user_turns, history, profit
+# Dependency to get a DB session
+def get_db():
+    db = SessionLocal()
     try:
-        with open(DATA_FILE, "r") as f:
-            data = json.load(f)
-            user_turns = data["user_turns"]
-            history = data["history"]
-            profit = data["profit"]
-    except FileNotFoundError:
-        save_data()
+        yield db
+    finally:
+        db.close()
 
-load_data()
+# --- Tai Xiu Logic ---
+def get_tai_xiu_result(xuc_xac_values: List[int]) -> Dict[str, any]:
+    """Calculates Tai/Xiu result from 3 dice values."""
+    if len(xuc_xac_values) != 3:
+        raise ValueError("Phải có đúng 3 giá trị xúc xắc.")
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "👋 Chào mừng đến với BOT TÀI XỈU VIP!\n"
-                          "🔹 /tx <mã MD5> → Dự đoán kết quả (mỗi lần trừ 1 lượt).\n"
-                          "🔹 /nap <số tiền> → Mua lượt dùng.\n"
-                          "🔹 /dabank <số tiền> <nội dung> → Gửi thông tin giao dịch ngân hàng để admin duyệt.\n"
-                          "🔹 /result <tài/xỉu> → Nhập kết quả thực tế (Admin).\n"
-                          "🔹 /history → Xem lịch sử & lãi/lỗ.\n"
-                          "🔹 /support → Liên hệ hỗ trợ.")
+    x1, x2, x3 = xuc_xac_values
+    tong = x1 + x2 + x3
+    ket_qua = "Tài" if 11 <= tong <= 17 else "Xỉu"
 
-@bot.message_handler(commands=['tx'])
-def get_tx_signal(message):
-    user_id = message.from_user.id
-    parts = message.text.split()
-    if len(parts) < 2 or len(parts[1]) != 32:
-        bot.reply_to(message, "❌ Vui lòng nhập mã MD5 hợp lệ!\n🔹 Ví dụ: /tx d41d8cd98f00b204e9800998ecf8427e")
-        return
+    # Rule for "Bão" (triple dice) - often classified as Xỉu
+    if x1 == x2 == x3:
+        ket_qua = "Xỉu" # Triplets (1-1-1 to 6-6-6) are often considered special "Xỉu"
 
-    turns = user_turns.get(user_id, 0)
-    if turns <= 0:
-        bot.reply_to(message, "⚠️ Bạn đã hết lượt dùng! Vui lòng dùng lệnh /nap <số tiền> để mua thêm.")
-        return
+    return {"Tong": tong, "Xuc_xac_1": x1, "Xuc_xac_2": x2, "Xuc_xac_3": x3, "Ket_qua": ket_qua}
 
-    user_turns[user_id] = turns - 1
-    save_data()
-    md5_hash = parts[1]
-    result_analysis = analyze_md5(md5_hash)
-    bot.reply_to(message, result_analysis + f"\n\n🎫 Lượt còn lại: {user_turns[user_id]}")
+# --- Pattern (Cầu) Analysis and Prediction Logic ---
 
-@bot.message_handler(commands=['result'])
-def set_actual_result(message):
-    global profit
-    if message.from_user.id not in ADMIN_IDS:
-        bot.reply_to(message, "⛔ Bạn không có quyền sử dụng lệnh này!")
-        return
+def analyze_patterns_and_predict(historical_results: List[str]) -> Dict[str, str]:
+    """
+    Analyzes common "cầu" patterns in historical results and provides a prediction.
+    This is a simplified example focusing on common patterns.
+    """
+    if len(historical_results) < 5: # Need at least a few results to find patterns
+        return {"Ket_qua_du_doan": "Không đủ dữ liệu để phân tích cầu", "Ty_le_thang": "0%"}
 
-    parts = message.text.split()
-    if len(parts) < 2 or parts[1].lower() not in ["tài", "xỉu"]:
-        bot.reply_to(message, "❌ Nhập kết quả hợp lệ! (tài/xỉu)")
-        return
+    # Reverse the list so the most recent result is at index 0
+    recent_history = historical_results[::-1] 
+    
+    # Simple pattern recognition
+    # Cầu Bệt (Consecutive results)
+    if len(recent_history) >= 3 and all(x == recent_history[0] for x in recent_history[:3]):
+        # If the last 3 results are the same (e.g., Tài-Tài-Tài)
+        # Predict the continuation of the "bệt"
+        return {
+            "Ket_qua_du_doan": recent_history[0], # Predicts Tài if last 3 were Tài
+            "Ty_le_thang": "70% (theo cầu bệt)" # Higher confidence for strong patterns
+        }
 
-    actual_result = parts[1].capitalize()
-    if not history:
-        bot.reply_to(message, "⚠️ Chưa có dự đoán nào!")
-        return
+    # Cầu Đảo (Alternating results)
+    if len(recent_history) >= 4 and \
+       recent_history[0] != recent_history[1] and \
+       recent_history[1] != recent_history[2] and \
+       recent_history[2] != recent_history[3]:
+        # If the last 4 results alternate (e.g., Tài-Xỉu-Tài-Xỉu)
+        # Predict the continuation of the alternating pattern
+        predicted = "Tài" if recent_history[0] == "Xỉu" else "Xỉu"
+        return {
+            "Ket_qua_du_doan": predicted, 
+            "Ty_le_thang": "65% (theo cầu đảo)"
+        }
+    
+    # Cầu 1-2-1 (Một Tài, hai Xỉu, một Tài)
+    if len(recent_history) >= 4 and \
+       recent_history[0] == recent_history[2] and \
+       recent_history[1] == recent_history[3] and \
+       recent_history[0] != recent_history[1]:
+        # Example: Xỉu-Tài-Xỉu-Tài -> predict Xỉu
+        # Example: Tài-Xỉu-Tài-Xỉu -> predict Tài
+        predicted = recent_history[1] # Predict the one that appears twice
+        return {
+            "Ket_qua_du_doan": predicted,
+            "Ty_le_thang": "60% (theo cầu 1-2-1)"
+        }
 
-    last_prediction = history[-1]
-    last_prediction["kết quả thực tế"] = actual_result
+    # Fallback to simple majority prediction if no specific pattern is found
+    tai_count = historical_results.count("Tài")
+    xiu_count = historical_results.count("Xỉu")
+    total_count = len(historical_results)
 
-    if last_prediction["dự đoán"] == actual_result:
-        profit += 1
-        status = "✅ Thắng kèo! 📈 (+1 điểm)"
+    if total_count == 0:
+        return {"Ket_qua_du_doan": "Không có dữ liệu", "Ty_le_thang": "0%"}
+
+    if tai_count > xiu_count:
+        predicted_outcome = "Tài"
+        win_percentage = f"{(tai_count / total_count) * 100:.0f}%"
+    elif xiu_count > tai_count:
+        predicted_outcome = "Xỉu"
+        win_percentage = f"{(xiu_count / total_count) * 100:.0f}%"
     else:
-        profit -= 1
-        status = "❌ Thua kèo! 📉 (-1 điểm)"
+        predicted_outcome = random.choice(["Tài", "Xỉu"])
+        win_percentage = "50%"
 
-    save_data()
-    bot.reply_to(message, f"📢 Cập nhật kết quả: {actual_result}\n{status}\n💰 Tổng lãi/lỗ: {profit} điểm")
+    return {"Ket_qua_du_doan": predicted_outcome, "Ty_le_thang": f"{win_percentage} (thống kê chung)"}
 
-@bot.message_handler(commands=['history'])
-def show_history(message):
-    if not history:
-        bot.reply_to(message, "📭 Chưa có dữ liệu lịch sử!")
-        return
 
-    history_text = "📜 LỊCH SỬ DỰ ĐOÁN & KẾT QUẢ:\n"
-    for idx, entry in enumerate(history[-5:], start=1):
-        history_text += f"🔹 Lần {idx}:\n"
-        history_text += f"   - 📊 Dự đoán: {entry['dự đoán']}\n"
-        history_text += f"   - 🎯 Kết quả thực tế: {entry['kết quả thực tế'] or '❓ Chưa có'}\n"
+# --- Main API Endpoint ---
+@app.get("/api/taixiu")
+async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_db)):
+    EXTERNAL_API_URL = "https://1.bot/GetNewLottery/LT_Taixiu"
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(EXTERNAL_API_URL, timeout=10.0) 
+            response.raise_for_status() 
+            external_data = response.json()
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi kết nối đến API bên ngoài: {exc}. Vui lòng thử lại sau."
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi xử lý phản hồi từ API bên ngoài: {e}"
+        )
 
-    user_id = message.from_user.id
-    turns = user_turns.get(user_id, 0)
-    history_text += f"\n💰 Tổng lãi/lỗ: {profit} điểm\n🎫 Lượt còn lại: {turns}"
-    bot.reply_to(message, history_text)
+    if external_data.get("state") != 1 or not external_data.get("data"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Dữ liệu từ API bên ngoài không hợp lệ hoặc không có kết quả."
+        )
 
-@bot.message_handler(commands=['nap'])
-def handle_nap(message):
-    parts = message.text.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        bot.reply_to(message, "❌ Vui lòng nhập số tiền hợp lệ! Ví dụ: /nap 100000")
-        return
+    data = external_data["data"]
+    
+    try:
+        expect_str = str(data["Expect"])
+        phien_so_nguyen = int(expect_str) 
+        
+        open_code_str = data["OpenCode"]
+        xuc_xac_values = [int(x.strip()) for x in open_code_str.split(',')]
+        
+        open_time_str = data["OpenTime"]
+        open_time_dt = datetime.strptime(open_time_str, "%Y-%m-%d %H:%M:%S")
 
-    amount = int(parts[1])
-    user_id = message.from_user.id
-    turns = amount // 1000
-    if turns < 10 or turns > 10000:
-        bot.reply_to(message, "⚠️ Bạn chỉ được mua từ 10 đến 10000 lượt (tương ứng từ 10,000đ đến 10,000,000đ).")
-        return
+        current_result_data = get_tai_xiu_result(xuc_xac_values)
+        
+        current_phien_record: Optional[PhienTaiXiu] = None
 
-    code = generate_nap_code()
-    reply = (f"💳 HƯỚNG DẪN NẠP TIỀN MUA LƯỢT\n\n"
-             f"➡️ Số tài khoản: 497720088\n"
-             f"➡️ Ngân hàng: MB Bank\n"
-             f"➡️ Số tiền: {amount} VNĐ\n"
-             f"➡️ Nội dung chuyển khoản: NAP{code}\n\n"
-             f"⏳ Sau khi chuyển khoản, admin sẽ duyệt và cộng {turns} lượt cho bạn.")
+        existing_phien = db.query(PhienTaiXiu).filter(
+            PhienTaiXiu.phien_so_nguyen == phien_so_nguyen
+        ).first()
+        
+        if not existing_phien:
+            new_phien = PhienTaiXiu(
+                phien_so_nguyen=phien_so_nguyen,
+                expect_string=expect_str,
+                open_time=open_time_dt,
+                ket_qua=current_result_data["Ket_qua"],
+                tong=current_result_data["Tong"],
+                xuc_xac_1=current_result_data["Xuc_xac_1"],
+                xuc_xac_2=current_result_data["Xuc_xac_2"],
+                xuc_xac_3=current_result_data["Xuc_xac_3"]
+            )
+            db.add(new_phien)
+            try:
+                db.commit()
+                db.refresh(new_phien)
+                current_phien_record = new_phien
+            except IntegrityError:
+                db.rollback()
+                current_phien_record = db.query(PhienTaiXiu).filter(
+                    PhienTaiXiu.phien_so_nguyen == phien_so_nguyen
+                ).first()
+                if not current_phien_record: 
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Lỗi hệ thống: Không thể lưu hoặc truy xuất phiên mới sau lỗi trùng lặp."
+                    )
+        else:
+            current_phien_record = existing_phien
 
-    for admin_id in ADMIN_IDS:
-        bot.send_message(admin_id, f"📥 YÊU CẦU NẠP TIỀN\n"
-                                   f"👤 User ID: {user_id}\n"
-                                   f"💰 Số tiền: {amount} VNĐ\n"
-                                   f"🎫 Lượt mua: {turns}\n"
-                                   f"📝 Nội dung: NAP{code}\n\n"
-                                   f"Duyệt bằng lệnh: /approve {user_id} {turns}")
+        # Fetch more historical sessions for better pattern analysis (e.g., 50 or 100)
+        # I'll use 50 here. You can adjust this number.
+        HISTORY_LIMIT = 50 
+        lich_su = db.query(PhienTaiXiu).order_by(PhienTaiXiu.phien_so_nguyen.desc()).limit(HISTORY_LIMIT).all()
+        
+        lich_su_formatted = [
+            {
+                "Phien": p.expect_string, 
+                "Ket_qua": p.ket_qua,
+                "Tong": p.tong,
+                "Xuc_xac_1": p.xuc_xac_1,
+                "Xuc_xac_2": p.xuc_xac_2,
+                "Xuc_xac_3": p.xuc_xac_3,
+                "OpenTime": p.open_time.strftime("%Y-%m-%d %H:%M:%S")
+            } for p in lich_su
+        ]
+        
+        # Extract only the "Ket_qua" for pattern analysis
+        historical_outcomes = [p["Ket_qua"] for p in lich_su_formatted]
 
-    bot.reply_to(message, reply)
+        # Predict based on pattern analysis
+        prediction = analyze_patterns_and_predict(historical_outcomes)
 
-@bot.message_handler(commands=['approve'])
-def approve_nap(message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
+        return {
+            "Ket_qua": current_phien_record.ket_qua,
+            "Phien": current_phien_record.expect_string,
+            "Tong": current_phien_record.tong,
+            "Xuc_xac_1": current_phien_record.xuc_xac_1,
+            "Xuc_xac_2": current_phien_record.xuc_xac_2,
+            "Xuc_xac_3": current_phien_record.xuc_xac_3,
+            "id": "Nhutquang", 
+            "Lich_su_gan_nhat": lich_su_formatted, # Renamed from "Lich_su_20_phien_gan_nhat" to be general
+            "Du_doan_phien_tiep_theo": prediction
+        }
 
-    parts = message.text.split()
-    if len(parts) < 3 or not parts[1].isdigit() or not parts[2].isdigit():
-        bot.reply_to(message, "❌ Sai cú pháp. Dùng /approve <user_id> <số lượt>")
-        return
+    except (KeyError, ValueError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Dữ liệu từ API bên ngoài không đúng định dạng hoặc thiếu trường bắt buộc: {e}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi không xác định trong quá trình xử lý yêu cầu: {e}"
+        )
 
-    uid = int(parts[1])
-    turns = int(parts[2])
-    user_turns[uid] = user_turns.get(uid, 0) + turns
-
-    save_data()
-    bot.send_message(uid, f"✅ Bạn đã được cộng {turns} lượt dùng!\n🎯 Dùng lệnh /tx <md5> để dự đoán.")
-    bot.reply_to(message, f"Đã cộng {turns} lượt cho user {uid}.")
-
-@bot.message_handler(commands=['dabank'])
-def handle_dabank(message):
-    parts = message.text.split()
-    if len(parts) < 3:
-        bot.reply_to(message, "❌ Vui lòng nhập đầy đủ thông tin giao dịch. Ví dụ: /dabank 100000 Nội dung chuyển tiền")
-        return
-
-    amount = parts[1]
-    content = " ".join(parts[2:])
-    user_id = message.from_user.id
-
-    for admin_id in ADMIN_IDS:
-        bot.send_message(admin_id, f"📥 YÊU CẦU NẠP TIỀN (GIAO DỊCH NGÂN HÀNG)\n"
-                                   f"👤 User ID: {user_id}\n"
-                                   f"💰 Số tiền: {amount} VNĐ\n"
-                                   f"📝 Nội dung: {content}\n\n"
-                                   f"Duyệt bằng lệnh: /approve {user_id} <số lượt>")
-
-    bot.reply_to(message, f"⏳ Đang chờ admin duyệt giao dịch.\n"
-                          f"Sau khi admin duyệt, bạn sẽ nhận được lượt dùng.\n"
-                          f"💰 Số tiền: {amount} VNĐ\n"
-                          f"📝 Nội dung: {content}")
-
-@bot.message_handler(commands=['support'])
-def handle_support(message):
-    bot.reply_to(message, "📩 Nếu bạn cần hỗ trợ, vui lòng liên hệ với admin tại: @cskhtool88")
-
-bot.polling()
+# To run locally: uvicorn main:app --reload
