@@ -11,9 +11,9 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy import create_engine
 
-# Đã thay đổi từ .database thành database
+# Đã thay đổi từ .database thành database để khắc phục ImportError
 from database import Base, get_db, PhienTaiXiu
-# Đã thay đổi từ .features thành features
+# Đã thay đổi từ .features thành features để khắc phục ImportError
 from features import extract_features, FEATURE_COLUMNS
 
 # --- Cấu hình Database ---
@@ -23,6 +23,7 @@ if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable is not set. Please set it for Render deployment.")
 
 engine = create_engine(DATABASE_URL)
+# Đảm bảo bảng được tạo nếu chưa có.
 Base.metadata.create_all(bind=engine) 
 
 app = FastAPI()
@@ -66,6 +67,7 @@ async def fetch_data_from_external_api_in_background():
                         continue
 
                     try:
+                        # API có thể trả về timestamp dưới dạng chuỗi, cần đảm bảo đúng kiểu
                         kai_jiang_time = datetime.fromtimestamp(int(kai_jiang_time_str) / 1000)
                     except (ValueError, TypeError):
                         print(f"Lỗi chuyển đổi kaiJiangTime: {kai_jiang_time_str}. Bỏ qua.")
@@ -119,7 +121,9 @@ async def startup_event():
 async def get_prediction(db: Session = Depends(get_db)):
     current_time = datetime.now()
     
-    latest_phien = db.query(PhienTaiXiu).order_by(PhienTaiXiu.expect_string.desc()).first()
+    # 1. Lấy thông tin phiên mới nhất từ database của bạn
+    # Sử dụng kai_jiang_time để sắp xếp, an toàn hơn và chính xác hơn cho thời gian
+    latest_phien = db.query(PhienTaiXiu).order_by(PhienTaiXiu.kai_jiang_time.desc()).first()
     
     phien_hien_tai_info = {}
     if latest_phien:
@@ -133,7 +137,9 @@ async def get_prediction(db: Session = Depends(get_db)):
     else:
         phien_hien_tai_info = {"ThongBao": "Chưa có dữ liệu phiên nào được xử lý hoặc lưu vào database."}
 
-    historical_records = db.query(PhienTaiXiu).order_by(PhienTaiXiu.expect_string.desc()).limit(HISTORY_LIMIT_FOR_ANALYSIS).all()
+    # 2. Lấy lịch sử để đưa vào mô hình dự đoán
+    # Sử dụng kai_jiang_time để sắp xếp lịch sử từ MỚI NHẤT -> CŨ NHẤT
+    historical_records = db.query(PhienTaiXiu).order_by(PhienTaiXiu.kai_jiang_time.desc()).limit(HISTORY_LIMIT_FOR_ANALYSIS).all()
     historical_results_strings = [rec.ket_qua_phien for rec in historical_records if rec.ket_qua_phien]
 
     du_doan_phien_tiep_theo = {}
