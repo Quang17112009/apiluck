@@ -5,7 +5,8 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
 from fastapi import FastAPI, Depends, HTTPException, status
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
+# Đã thêm BigInteger vào import
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, BigInteger 
 # Đã sửa lỗi cảnh báo: import declarative_base từ sqlalchemy.orm thay vì sqlalchemy.ext.declarative
 from sqlalchemy.orm import sessionmaker, Session, declarative_base 
 from sqlalchemy.exc import IntegrityError # To handle duplicate key errors
@@ -31,8 +32,8 @@ class PhienTaiXiu(Base):
     id = Column(Integer, primary_key=True, index=True)
     # expect_string từ API bên ngoài, dùng làm định danh duy nhất cho một phiên
     expect_string = Column(String, unique=True, index=True, nullable=False) 
-    # expect_string chuyển đổi sang số nguyên, để sắp xếp và truy vấn dễ hơn
-    phien_so_nguyen = Column(Integer, index=True, nullable=False) 
+    # ĐÃ THAY ĐỔI KIỂU DỮ LIỆU TỪ Integer SANG BigInteger
+    phien_so_nguyen = Column(BigInteger, index=True, nullable=False) 
     
     open_time = Column(DateTime)
     ket_qua = Column(String) # "Tài" or "Xỉu"
@@ -221,10 +222,13 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
                 current_phien_record = new_phien
             except IntegrityError:
                 db.rollback()
+                # Nếu có lỗi trùng lặp, có thể do một request khác đã thêm vào trước
+                # Cố gắng truy vấn lại để lấy phiên đã tồn tại
                 current_phien_record = db.query(PhienTaiXiu).filter(
                     PhienTaiXiu.phien_so_nguyen == phien_so_nguyen
                 ).first()
                 if not current_phien_record: 
+                    # Nếu vẫn không tìm thấy, có lỗi nghiêm trọng hơn
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         detail="Lỗi hệ thống: Không thể lưu hoặc truy xuất phiên mới sau lỗi trùng lặp."
