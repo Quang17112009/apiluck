@@ -9,16 +9,20 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import sessionmaker, Session, declarative_base 
 from sqlalchemy.exc import IntegrityError 
 
+# Imports cho tác vụ nền
+import asyncio 
+import time # Cho time.sleep nếu cần dùng để backoff
+
 app = FastAPI()
 
-# --- Database Configuration (PostgreSQL) ---
+# --- Cấu hình Database (PostgreSQL) ---
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/taixiu_db") 
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 Base = declarative_base()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# --- Database Model Definition ---
+# --- Định nghĩa Model Database ---
 class PhienTaiXiu(Base):
     __tablename__ = "phien_tai_xiu"
     
@@ -130,90 +134,127 @@ def analyze_patterns_and_predict(historical_results: List[str]) -> Dict[str, str
 
     return {"Ket_qua_du_doan": predicted_outcome, "Ty_le_thang": f"{win_percentage} (thống kê chung)"}
 
+# --- Tác vụ nền để lấy dữ liệu từ API bên ngoài ---
+# Biến global để kiểm soát trạng thái tác vụ nền
+is_background_task_running = False
 
-# --- Main API Endpoint ---
+async def fetch_data_from_external_api_in_background():
+    global is_background_task_running
+    EXTERNAL_API_URL = "https://1.bot/GetNewLottery/LT_Taixiu"
+    polling_interval = 10 # Giây - Điều chỉnh theo ý muốn, nhưng cẩn thận với giới hạn tần suất gọi!
+
+    # Cache trong bộ nhớ để lưu Expect string của phiên cuối cùng đã xử lý
+    last_processed_expect = None 
+
+    while is_background_task_running:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(EXTERNAL_API_URL)
+                response.raise_for_status() # Báo lỗi nếu status code là 4xx/5xx
+                external_data = response.json()
+
+            if external_data.get("state") == 1 and external_data.get("data"):
+                data = external_data["data"]
+                expect_str = str(data["Expect"])
+
+                if expect_str != last_processed_expect:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Detected new session: {expect_str}")
+                    
+                    open_code_str = data["OpenCode"]
+                    xuc_xac_values = [int(x.strip()) for x in open_code_str.split(',')]
+                    open_time_str = data["OpenTime"]
+                    open_time_dt = datetime.strptime(open_time_str, "%Y-%m-%d %H:%M:%S")
+
+                    current_result_data = get_tai_xiu_result(xuc_xac_values)
+
+                    # Tạo một session DB mới cho tác vụ nền để tránh xung đột
+                    bg_db = SessionLocal() 
+                    try:
+                        existing_phien = bg_db.query(PhienTaiXiu).filter(
+                            PhienTaiXiu.expect_string == expect_str 
+                        ).first()
+                        
+                        if not existing_phien:
+                            new_phien = PhienTaiXiu(
+                                expect_string=expect_str,
+                                open_time=open_time_dt,
+                                ket_qua=current_result_data["Ket_qua"],
+                                tong=current_result_data["Tong"],
+                                xuc_xac_1=current_result_data["Xuc_xac_1"],
+                                xuc_xac_2=current_result_data["Xuc_xac_2"],
+                                xuc_xac_3=current_result_data["Xuc_xac_3"]
+                            )
+                            bg_db.add(new_phien)
+                            bg_db.commit()
+                            bg_db.refresh(new_phien)
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] Saved session {expect_str} to DB.")
+                        else:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] Session {expect_str} already exists in DB. Skipping save.")
+                        
+                        last_processed_expect = expect_str # Cập nhật cache sau khi xử lý thành công
+
+                    except IntegrityError:
+                        bg_db.rollback()
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] IntegrityError for {expect_str}. Session likely added by another concurrent call.")
+                        last_processed_expect = expect_str # Vẫn đánh dấu là đã xử lý để không thử lại
+                    except Exception as e:
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Error saving session {expect_str}: {e}")
+                        bg_db.rollback()
+                    finally:
+                        bg_db.close()
+                else:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Session {expect_str} already processed. Waiting for new data.")
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] External API data invalid or empty: {external_data}")
+
+        except httpx.RequestError as exc:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Error connecting to external API: {exc}")
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Unexpected error in background task: {e}")
+        
+        await asyncio.sleep(polling_interval)
+
+# --- FastAPI Events (Sự kiện khởi động và tắt ứng dụng) ---
+@app.on_event("startup")
+async def startup_event():
+    global is_background_task_running
+    is_background_task_running = True
+    # Khởi động tác vụ nền nhưng không chờ nó hoàn thành
+    asyncio.create_task(fetch_data_from_external_api_in_background()) 
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global is_background_task_running
+    is_background_task_running = False
+    print("Background task stopping...")
+    # Cho phép tác vụ nền có thời gian để hoàn thành vòng lặp hiện tại
+    await asyncio.sleep(1) 
+
+# --- Endpoint API chính ---
 @app.get("/api/taixiu")
 async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_db)):
-    EXTERNAL_API_URL = "https://1.bot/GetNewLottery/LT_Taixiu"
-    
+    # Endpoint chính này giờ đây chủ yếu truy xuất dữ liệu đã được lưu bởi tác vụ nền.
+    # Nó KHÔNG gọi API bên ngoài trực tiếp nữa.
+
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(EXTERNAL_API_URL, timeout=10.0) 
-            response.raise_for_status() 
-            external_data = response.json()
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Lỗi khi kết nối đến API bên ngoài: {exc}. Vui lòng thử lại sau."
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Lỗi khi xử lý phản hồi từ API bên ngoài: {e}"
-        )
+        # Lấy phiên mới nhất đã được lưu bởi background task
+        current_phien_record = db.query(PhienTaiXiu).order_by(PhienTaiXiu.expect_string.desc()).first()
 
-    if external_data.get("state") != 1 or not external_data.get("data"):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Dữ liệu từ API bên ngoài không hợp lệ hoặc không có kết quả."
-        )
-
-    data = external_data["data"]
-    
-    try:
-        expect_str = str(data["Expect"])
-        
-        open_code_str = data["OpenCode"]
-        xuc_xac_values = [int(x.strip()) for x in open_code_str.split(',')]
-        
-        open_time_str = data["OpenTime"]
-        open_time_dt = datetime.strptime(open_time_str, "%Y-%m-%d %H:%M:%S")
-
-        current_result_data = get_tai_xiu_result(xuc_xac_values)
-        
-        current_phien_record: Optional[PhienTaiXiu] = None
-
-        existing_phien = db.query(PhienTaiXiu).filter(
-            PhienTaiXiu.expect_string == expect_str 
-        ).first()
-        
-        if not existing_phien:
-            new_phien = PhienTaiXiu(
-                expect_string=expect_str,
-                open_time=open_time_dt,
-                ket_qua=current_result_data["Ket_qua"],
-                tong=current_result_data["Tong"],
-                xuc_xac_1=current_result_data["Xuc_xac_1"],
-                xuc_xac_2=current_result_data["Xuc_xac_2"],
-                xuc_xac_3=current_result_data["Xuc_xac_3"]
+        if not current_phien_record:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Chưa có dữ liệu phiên nào được xử lý. Vui lòng thử lại sau khi hệ thống đã cập nhật phiên đầu tiên."
             )
-            db.add(new_phien)
-            try:
-                db.commit()
-                db.refresh(new_phien)
-                current_phien_record = new_phien
-            except IntegrityError:
-                db.rollback()
-                current_phien_record = db.query(PhienTaiXiu).filter(
-                    PhienTaiXiu.expect_string == expect_str 
-                ).first()
-                if not current_phien_record: 
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Lỗi hệ thống: Không thể lưu hoặc truy xuất phiên mới sau lỗi trùng lặp."
-                    )
-        else:
-            current_phien_record = existing_phien
 
-        # Lấy số lượng phiên lịch sử lớn hơn để phân tích cầu (ví dụ: 100 phiên)
+        # Số lượng phiên lịch sử để phân tích cầu (vd: 100 phiên)
         HISTORY_LIMIT_FOR_ANALYSIS = 100 
-        # Chỉ hiển thị 20 phiên gần nhất trong phản hồi API
+        # Số lượng phiên lịch sử chỉ để hiển thị trong phản hồi API (vd: 20 phiên)
         DISPLAY_HISTORY_LIMIT = 20 
 
-        # Truy vấn 100 phiên để đảm bảo dữ liệu phân tích đầy đủ
+        # Truy vấn số lượng phiên lớn hơn để đảm bảo dữ liệu phân tích đầy đủ
         lich_su = db.query(PhienTaiXiu).order_by(PhienTaiXiu.expect_string.desc()).limit(HISTORY_LIMIT_FOR_ANALYSIS).all()
         
-        # Chỉ định dạng và lấy 20 phiên đầu tiên cho phần hiển thị
+        # Định dạng đầy đủ lịch sử
         lich_su_formatted_full = [
             {
                 "Phien": p.expect_string, 
@@ -225,13 +266,13 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
                 "OpenTime": p.open_time.strftime("%Y-%m-%d %H:%M:%S")
             } for p in lich_su
         ]
-        # Cắt lấy 20 phiên gần nhất để hiển thị
+        # Cắt lấy số lượng phiên giới hạn để hiển thị
         lich_su_formatted_display = lich_su_formatted_full[:DISPLAY_HISTORY_LIMIT]
 
-        # Chỉ lấy kết quả "Tài" hoặc "Xỉu" từ TẤT CẢ 100 phiên để truyền vào hàm phân tích cầu
+        # Chỉ lấy kết quả "Tài" hoặc "Xỉu" từ TẤT CẢ các phiên đã truy vấn để phân tích cầu
         historical_outcomes_for_analysis = [p["Ket_qua"] for p in lich_su_formatted_full]
 
-        # Dự đoán dựa trên phân tích cầu
+        # Thực hiện dự đoán
         prediction = analyze_patterns_and_predict(historical_outcomes_for_analysis)
 
         # Trả về phản hồi API cuối cùng
@@ -244,19 +285,16 @@ async def get_taixiu_data_with_history_and_prediction(db: Session = Depends(get_
                 current_phien_record.xuc_xac_2,
                 current_phien_record.xuc_xac_3
             ],
-            "admin_name": "Nhutquang", # Đổi key từ "id" sang "admin_name"
-            "Lich_su_gan_nhat": lich_su_formatted_display, # Chỉ hiển thị 20 phiên
+            "admin_name": "Nhutquang", 
+            "Lich_su_gan_nhat": lich_su_formatted_display, 
             "Du_doan_phien_tiep_theo": prediction
         }
 
-    except (KeyError, ValueError) as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Dữ liệu từ API bên ngoài không đúng định dạng hoặc thiếu trường bắt buộc: {e}"
-        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Lỗi không xác định trong quá trình xử lý yêu cầu: {e}"
+            detail=f"Lỗi không xác định trong quá trình xử lý yêu cầu: {e}. Vui lòng kiểm tra logs để biết thêm chi tiết."
         )
 
+# Để chạy cục bộ:
+# uvicorn main:app --reload
